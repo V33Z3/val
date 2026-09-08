@@ -1,18 +1,19 @@
-import os
-import httpx
+# app.py
+import streamlit as st
 import duckdb
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-from apscheduler.schedulers.background import BackgroundScheduler
+import pandas as pd
 
-app = FastAPI(title="VAL Rollers Inc. - DLA Command & Pricing Center")
+st.set_page_config(
+    page_title="VAL ROLLERS INC. - DLA Command Center",
+    layout="wide"
+)
 
-db_con = duckdb.connect(database=":memory:")
-SAM_API_KEY = "SAM-d6c9ee9b-53d8-4892-a7cd-4ff55a7ce708"
-UEI = "TRH4N9X474F6"
-
+# Initialize DuckDB in-memory database and populate tables
+@st.cache_resource
 def init_db():
-    db_con.execute("""
+    con = duckdb.connect(database=":memory:")
+    
+    con.execute("""
         CREATE TABLE IF NOT EXISTS contract_archive (
             contract_id VARCHAR PRIMARY KEY,
             part_number VARCHAR,
@@ -24,19 +25,18 @@ def init_db():
         );
     """)
     
-    res = db_con.execute("SELECT COUNT(*) FROM contract_archive").fetchone()[0]
+    res = con.execute("SELECT COUNT(*) FROM contract_archive").fetchone()[0]
     if res == 0:
-        db_con.execute("""
+        con.execute("""
             INSERT INTO contract_archive VALUES 
             ('SPE4A526V1114', 'VAL3900', 'DLA Aviation Titanium Fastener & Roller Lot', '2026-05-28', '2026-11-28', 1474.00, 'ACTIVE'),
             ('SPE4A526V0815', 'AM3885-G', 'Air Force Ground Support Roller Lot (SAM.gov)', '2026-05-13', '2026-11-13', 70488.00, 'ACTIVE'),
             ('SPE4A626PB076', 'LG-9021', 'Marine Corps Amphibious Drive Shaft', '2026-01-06', '2027-01-06', 24321.00, 'COMPLETED'),
             ('SPE4A525V2130', 'VAL4000', 'Air Force Ground Support Casters', '2025-07-25', '2026-01-25', 16619.11, 'COMPLETED'),
-            ('SPE4A125V0332', 'VAL3900', 'Navy Phalanx CIWS Feed Roller', '2025-03-31', '2025-09-31', 31960.00, 'COMPLETED')
-        ;
-    """)
+            ('SPE4A125V0332', 'VAL3900', 'Navy Phalanx CIWS Feed Roller', '2025-03-31', '2025-09-31', 31960.00, 'COMPLETED');
+        """)
 
-    db_con.execute("""
+    con.execute("""
         CREATE OR REPLACE TABLE nsn_registry AS 
         SELECT * FROM (VALUES 
             ('4920-00-782-3806', 'VAL3900 / 21C2201-093', 'Roller, Adapter Assembly', 'F/A-18 Engine Tooling / DLA Aviation', 'MIL-Q-9858 / ISO 9001:2015'),
@@ -47,8 +47,7 @@ def init_db():
         ) AS t(nsn, cross_parts, item_name, application_platform, quality_standard);
     """)
 
-    # Updated with realistic current active bids, accurate unit material costs from supplier quotes, and calculated margins
-    db_con.execute("""
+    con.execute("""
         CREATE OR REPLACE TABLE dibbs_solicitations AS 
         SELECT * FROM (VALUES 
             ('RFQ-DLA-2026-9901', '4920-00-782-3806', 'VAL3900', 'Roller, Adapter Urgent Open Solicitation', 15, '2026-09-25', 'OPEN_BIDDING', 24850.00, 1656.66, 670.00, 986.66, 14800.00),
@@ -59,7 +58,7 @@ def init_db():
         ) AS t(solicitation_id, nsn, part_number, description, target_quantity, response_deadline, status, estimated_contract_value, current_unit_bid, unit_material_cost, unit_profit, total_projected_profit);
     """)
 
-    db_con.execute("""
+    con.execute("""
         CREATE OR REPLACE TABLE supplier_quotes AS 
         SELECT * FROM (VALUES 
             ('SUP-01', 'AeroMetal Stock Co.', '4920-00-782-3806', 'Alloy Steel Bar Stock (DFARS Compliant)', 450.00, '2026-06-01', 'ACTIVE'),
@@ -69,190 +68,167 @@ def init_db():
             ('SUP-05', 'Titan Thermal Processors', '2840-01-441-9082', 'Superalloy Thermal Barrier Coating', 189.00, '2026-06-18', 'ACTIVE')
         ) AS t(supplier_id, supplier_name, nsn, material_description, quote_cost, quote_date, status);
     """)
+    return con
 
-init_db()
+db_con = init_db()
 
-@app.get("/api/data/{table_name}")
-def get_table_data(table_name: str):
-    valid_tables = ["contract_archive", "nsn_registry", "dibbs_solicitations", "supplier_quotes"]
-    if table_name not in valid_tables:
-        raise HTTPException(status_code=404, detail="Table not found")
-    
-    if table_name == "contract_archive":
-        query = f"SELECT * FROM {table_name} ORDER BY start_date DESC"
-    elif table_name == "dibbs_solicitations":
-        query = f"SELECT * FROM {table_name} ORDER BY response_deadline ASC"
-    elif table_name == "supplier_quotes":
-        query = f"SELECT * FROM {table_name} ORDER BY quote_date ASC"
-    else:
-        query = f"SELECT * FROM {table_name}"
+# Initialize Session State for Inspection Telemetry
+if 'selected_record' not in st.session_state:
+    st.session_state['selected_record'] = None
 
-    res = db_con.execute(query).fetchall()
-    columns = [desc[0] for desc in db_con.description]
-    data = [dict(zip(columns, row)) for row in res]
-    return {"records": len(data), "data": data}
+# Custom styling for dark theme and badges
+st.markdown("""
+<style>
+    .stApp {
+        background-color: #020617;
+        color: #f1f5f9;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-@app.get("/", response_class=HTMLResponse)
-def serve_frontend():
-    return """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>VAL ROLLERS INC. - DLA Command Center</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-slate-950 text-slate-100 font-sans min-h-screen p-6">
-    <header class="flex justify-between items-center mb-8 border-b border-slate-800 pb-4">
-        <div>
-            <div class="flex items-center gap-3">
-                <h1 class="text-2xl font-black tracking-wide">VAL ROLLERS INC.</h1>
-                <span class="bg-indigo-950 text-indigo-300 text-xs px-2 py-0.5 rounded border border-indigo-800">CAGE: 0B039</span>
-                <span class="bg-indigo-950 text-indigo-300 text-xs px-2 py-0.5 rounded border border-indigo-800">UEI: TRH4N9X474F6</span>
-            </div>
-            <p class="text-slate-400 text-sm mt-1">Defense Logistics Agency (DLA) Ontology Command & Pricing Center</p>
-        </div>
-        <div class="flex gap-3">
-            <button onclick="exportCSV()" class="bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-semibold px-4 py-2 rounded transition flex items-center gap-2">
-                Export DLA Batch Bid CSV
-            </button>
-            <span class="bg-emerald-950 text-emerald-400 text-xs px-3 py-2 rounded border border-emerald-800 flex items-center font-medium">SAM.gov Live Sync Active</span>
-        </div>
-    </header>
+# Header Section
+header_col1, header_col2 = st.columns([3, 1])
+with header_col1:
+    st.markdown("## VAL ROLLERS INC.")
+    st.markdown(
+        '<span style="background-color: #1e1b4b; color: #a5b4fc; font-size: 11px; padding: 3px 8px; border-radius: 4px; border: 1px solid #312e81; font-weight: bold;">CAGE: 0B039</span> '
+        '<span style="background-color: #1e1b4b; color: #a5b4fc; font-size: 11px; padding: 3px 8px; border-radius: 4px; border: 1px solid #312e81; font-weight: bold;">UEI: TRH4N9X474F6</span>',
+        unsafe_allow_html=True
+    )
+    st.markdown("<p style='color: #94a3b8; font-size: 13px; margin-top: 5px;'>Defense Logistics Agency (DLA) Ontology Command & Pricing Center</p>", unsafe_allow_html=True)
 
-    <nav class="flex gap-3 mb-6">
-        <button onclick="switchTab('contract_archive')" id="btn-contract_archive" class="tab-btn px-4 py-2 rounded bg-slate-900 text-slate-300 text-sm font-medium hover:bg-slate-800 transition">Contract Archive & Analytics</button>
-        <button onclick="switchTab('nsn_registry')" id="btn-nsn_registry" class="tab-btn px-4 py-2 rounded bg-slate-900 text-slate-300 text-sm font-medium hover:bg-slate-800 transition">NSN Registry</button>
-        <button onclick="switchTab('dibbs_solicitations')" id="btn-dibbs_solicitations" class="tab-btn px-4 py-2 rounded bg-indigo-700 text-white text-sm font-medium transition">Active DIBBS Solicitations</button>
-        <button onclick="switchTab('supplier_quotes')" id="btn-supplier_quotes" class="tab-btn px-4 py-2 rounded bg-slate-900 text-slate-300 text-sm font-medium hover:bg-slate-800 transition">Supplier Quotations</button>
-    </nav>
+with header_col2:
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("Export DLA Batch Bid CSV", type="primary", use_container_width=True):
+        st.success("Batch bid CSV package generated successfully for DLA submission compliance.")
+    st.markdown('<div style="text-align: right;"><span style="background-color: #022c22; color: #34d399; font-size: 11px; padding: 4px 10px; border-radius: 4px; border: 1px solid #065f46; display: inline-block;">SAM.gov Live Sync Active</span></div>', unsafe_allow_html=True)
 
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div class="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-lg">
-            <div class="flex justify-between items-center mb-4 border-b border-slate-800 pb-3">
-                <h2 id="table-title" class="text-indigo-400 font-bold uppercase tracking-wider text-sm">ACTIVE DLA DIBBS OPEN SOLICITATIONS</h2>
-                <span id="record-count" class="bg-slate-800 text-slate-300 text-xs px-2.5 py-1 rounded-full">5 records</span>
-            </div>
-            <div id="table-container" class="space-y-3 max-h-[600px] overflow-y-auto pr-2">
-                <!-- Dynamic cards injected here -->
-            </div>
-        </div>
+st.markdown("---")
 
-        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-lg flex flex-col justify-between">
-            <div>
-                <h2 class="text-slate-300 font-bold tracking-wide text-sm">INTELLIGENCE & MARGIN TRACKING</h2>
-                <p class="text-slate-500 text-xs mt-1 mb-6">Computed unit economics and automated bid baselines.</p>
-                <div id="intelligence-panel" class="text-slate-400 text-sm flex flex-col items-center justify-center h-64 border border-dashed border-slate-800 rounded-lg p-6 text-center">
-                    <svg class="w-12 h-12 text-slate-600 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
-                    <p class="font-medium text-slate-300">No record selected</p>
-                    <p class="text-xs text-slate-500 mt-1">Select an item from the left panel to inspect economic data.</p>
-                </div>
-            </div>
-        </div>
-    </div>
+# Navigation Tabs
+tab_choice = st.radio(
+    "Navigation", 
+    ["Active DIBBS Solicitations", "Contract Archive & Analytics", "NSN Registry", "Supplier Quotations"],
+    horizontal=True,
+    label_visibility="collapsed"
+)
 
-    <script>
-        let currentTab = 'dibbs_solicitations';
+st.markdown("<br>", unsafe_allow_html=True)
+
+# Main Grid Layout (Left: Records Container, Right: Intelligence Panel)
+col_left, col_right = st.columns([2, 1], gap="large")
+
+with col_left:
+    if tab_choice == "Active DIBBS Solicitations":
+        st.markdown("<h3 style='font-size: 14px; color: #818cf8; font-weight: bold; letter-spacing: 0.05em;'>ACTIVE DLA DIBBS OPEN SOLICITATIONS</h3>", unsafe_allow_html=True)
+        query = "SELECT * FROM dibbs_solicitations ORDER BY response_deadline ASC"
+        df = db_con.execute(query).fetchdf()
+        st.markdown(f"<span style='background-color: #1e293b; color: #cbd5e1; font-size: 11px; padding: 2px 8px; border-radius: 10px;'>{len(df)} records</span>", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
         
-        async function switchTab(tab) {
-            currentTab = tab;
-            document.querySelectorAll('.tab-btn').forEach(b => {
-                b.classList.replace('bg-indigo-700', 'bg-slate-900');
-                b.classList.add('hover:bg-slate-800');
-            });
-            const activeBtn = document.getElementById(`btn-${tab}`);
-            activeBtn.classList.replace('bg-slate-900', 'bg-indigo-700');
-            activeBtn.classList.remove('hover:bg-slate-800');
-            
-            const titles = {
-                'contract_archive': 'CONTRACT ARCHIVE & ANALYTICS',
-                'nsn_registry': 'NATO STOCK NUMBER (NSN) REGISTRY',
-                'dibbs_solicitations': 'ACTIVE DLA DIBBS OPEN SOLICITATIONS',
-                'supplier_quotes': 'SUBCONTRACTOR & SUPPLIER QUOTATION TRACKER'
-            };
-            document.getElementById('table-title').innerText = titles[tab];
-            
-            await loadData();
-        }
+        for _, row in df.iterrows():
+            with st.container():
+                st.markdown(f"""
+                <div style="background-color: #0f172a; border: 1px solid #1e293b; padding: 14px; border-radius: 8px; margin-bottom: 10px;">
+                    <span style="background-color: #451a03; color: #fbbf24; font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 4px; border: 1px solid #78350f;">OPEN RFQ</span>
+                    <h4 style="color: white; margin: 6px 0 4px 0; font-size: 14px;">{row['description']}</h4>
+                    <p style="color: #94a3b8; font-size: 11px; margin: 0; line-height: 1.5;">
+                        RFQ: {row['solicitation_id']} • Part: <span style="color: #818cf8; font-family: monospace;">{row['part_number']}</span> • Qty: {row['target_quantity']}<br>
+                        Current Bid: <span style="color: #34d399; font-weight: bold;">${row['current_unit_bid']:,.2f}</span>/unit | 
+                        Mat. Cost: <span style="color: #fbbf24; font-weight: bold;">${row['unit_material_cost']:,.2f}</span> | 
+                        Profit: <span style="color: #22d3ee; font-weight: bold;">${row['unit_profit']:,.2f}/unit (${row['total_projected_profit']:,.2f} total)</span>
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+                if st.button("Analyze", key=f"btn_dibbs_{row['solicitation_id']}"):
+                    st.session_state['selected_record'] = row.to_dict()
 
-        async function loadData() {
-            try {
-                const res = await fetch(`/api/data/${currentTab}`);
-                const json = await res.json();
-                document.getElementById('record-count').innerText = `${json.records} records`;
-                
-                const container = document.getElementById('table-container');
-                container.innerHTML = '';
-                
-                json.data.forEach(row => {
-                    const card = document.createElement('div');
-                    card.className = "bg-slate-950/60 border border-slate-800/80 rounded-lg p-4 flex justify-between items-center hover:border-indigo-600/50 transition";
-                    
-                    let badgeText = "SUPPLIER QUOTE";
-                    let badgeColor = "bg-emerald-950 text-emerald-400 border-emerald-800";
-                    let titleText = row.material_description || '';
-                    let subText = `Vendor: ${row.supplier_name || ''} • Cost: $${row.quote_cost || 0}`;
-                    let btnText = "View";
-                    
-                    if (currentTab === 'dibbs_solicitations') {
-                        badgeText = "OPEN RFQ";
-                        badgeColor = "bg-amber-950 text-amber-400 border-amber-800";
-                        titleText = row.description;
-                        subText = `RFQ: ${row.solicitation_id} • Part: <span class="text-indigo-400 font-mono">${row.part_number}</span> • Qty: ${row.target_quantity} • Current Bid: <span class="text-emerald-400 font-semibold">$${row.current_unit_bid}</span>/unit • Mat. Cost: <span class="text-amber-400 font-semibold">$${row.unit_material_cost}</span> • Profit: <span class="text-cyan-400 font-semibold">$${row.unit_profit}/unit ($${row.total_projected_profit} total)</span>`;
-                        btnText = "Analyze";
-                    } else if (currentTab === 'nsn_registry') {
-                        badgeText = "NSN ITEM";
-                        badgeColor = "bg-purple-950 text-purple-400 border-purple-800";
-                        titleText = row.item_name;
-                        subText = `NSN: ${row.nsn} • Parts: ${row.cross_parts}`;
-                        btnText = "Inspect";
-                    } else if (currentTab === 'contract_archive') {
-                        badgeText = row.status;
-                        badgeColor = row.status === 'ACTIVE' ? "bg-emerald-950 text-emerald-400 border-emerald-800" : "bg-slate-800 text-slate-400 border-slate-700";
-                        titleText = row.contract_title;
-                        subText = `Contract: ${row.contract_id} • Part: ${row.part_number || 'N/A'} • Start: ${row.start_date} • Value: $${row.total_value}`;
-                        btnText = "Review";
-                    }
-                    
-                    card.innerHTML = `
-                        <div>
-                            <div class="flex items-center gap-2">
-                                <span class="text-[10px] font-bold px-2 py-0.5 rounded border ${badgeColor}">${badgeText}</span>
-                                ${currentTab === 'contract_archive' ? `<span class="text-[10px] font-mono bg-indigo-950 text-indigo-300 px-2 py-0.5 rounded border border-indigo-800">Part: ${row.part_number || 'N/A'}</span>` : ''}
-                            </div>
-                            <h3 class="font-semibold text-white mt-1.5 text-sm">${titleText}</h3>
-                            <p class="text-xs text-slate-400 mt-0.5">${subText}</p>
-                        </div>
-                        <button onclick='inspectRecord(${JSON.stringify(row)})' class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-4 py-1.5 rounded transition">${btnText}</button>
-                    `;
-                    container.appendChild(card);
-                });
-            } catch (err) {
-                console.error(err);
-            }
-        }
+    elif tab_choice == "Contract Archive & Analytics":
+        st.markdown("<h3 style='font-size: 14px; color: #818cf8; font-weight: bold; letter-spacing: 0.05em;'>CONTRACT ARCHIVE & ANALYTICS</h3>", unsafe_allow_html=True)
+        query = "SELECT * FROM contract_archive ORDER BY start_date DESC"
+        df = db_con.execute(query).fetchdf()
+        st.markdown(f"<span style='background-color: #1e293b; color: #cbd5e1; font-size: 11px; padding: 2px 8px; border-radius: 10px;'>{len(df)} records</span>", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        for _, row in df.iterrows():
+            badge_bg = "#064e3b" if row['status'] == 'ACTIVE' else "#1e293b"
+            badge_fg = "#34d399" if row['status'] == 'ACTIVE' else "#94a3b8"
+            with st.container():
+                st.markdown(f"""
+                <div style="background-color: #0f172a; border: 1px solid #1e293b; padding: 14px; border-radius: 8px; margin-bottom: 10px;">
+                    <span style="background-color: {badge_bg}; color: {badge_fg}; font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 4px;">{row['status']}</span>
+                    <span style="font-family: monospace; font-size: 10px; background-color: #312e81; color: #a5b4fc; padding: 2px 6px; border-radius: 4px; margin-left: 6px;">Part: {row['part_number']}</span>
+                    <h4 style="color: white; margin: 6px 0 4px 0; font-size: 14px;">{row['contract_title']}</h4>
+                    <p style="color: #94a3b8; font-size: 11px; margin: 0;">
+                        Contract: {row['contract_id']} • Start: {row['start_date']} • Value: <span style="color: #34d399; font-weight: bold;">${row['total_value']:,.2f}</span>
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+                if st.button("Review", key=f"btn_contract_{row['contract_id']}"):
+                    st.session_state['selected_record'] = row.to_dict()
 
-        function inspectRecord(row) {
-            const panel = document.getElementById('intelligence-panel');
-            panel.className = "text-left text-sm space-y-2";
-            
-            let html = `<div class="border-b border-slate-800 pb-2 mb-2"><span class="text-xs text-indigo-400 font-semibold uppercase">Inspection telemetry</span></div>`;
-            for (const [key, val] of Object.entries(row)) {
-                html += `<div><strong class="text-slate-400 capitalize text-xs">${key.replace('_', ' ')}:</strong> <span class="text-slate-200 text-xs block">${val}</span></div>`;
-            }
-            panel.innerHTML = html;
-        }
+    elif tab_choice == "NSN Registry":
+        st.markdown("<h3 style='font-size: 14px; color: #818cf8; font-weight: bold; letter-spacing: 0.05em;'>NATO STOCK NUMBER (NSN) REGISTRY</h3>", unsafe_allow_html=True)
+        query = "SELECT * FROM nsn_registry"
+        df = db_con.execute(query).fetchdf()
+        st.markdown(f"<span style='background-color: #1e293b; color: #cbd5e1; font-size: 11px; padding: 2px 8px; border-radius: 10px;'>{len(df)} records</span>", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        for _, row in df.iterrows():
+            with st.container():
+                st.markdown(f"""
+                <div style="background-color: #0f172a; border: 1px solid #1e293b; padding: 14px; border-radius: 8px; margin-bottom: 10px;">
+                    <span style="background-color: #3b0764; color: #d8b4fe; font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 4px;">NSN ITEM</span>
+                    <h4 style="color: white; margin: 6px 0 4px 0; font-size: 14px;">{row['item_name']}</h4>
+                    <p style="color: #94a3b8; font-size: 11px; margin: 0;">
+                        NSN: <span style="color: #818cf8; font-family: monospace;">{row['nsn']}</span> • Parts: {row['cross_parts']}
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+                if st.button("Inspect", key=f"btn_nsn_{row['nsn']}"):
+                    st.session_state['selected_record'] = row.to_dict()
 
-        function exportCSV() {
-            alert('Batch bid CSV package generated successfully for DLA submission compliance.');
-        }
+    elif tab_choice == "Supplier Quotations":
+        st.markdown("<h3 style='font-size: 14px; color: #818cf8; font-weight: bold; letter-spacing: 0.05em;'>SUBCONTRACTOR & SUPPLIER QUOTATION TRACKER</h3>", unsafe_allow_html=True)
+        query = "SELECT * FROM supplier_quotes ORDER BY quote_date ASC"
+        df = db_con.execute(query).fetchdf()
+        st.markdown(f"<span style='background-color: #1e293b; color: #cbd5e1; font-size: 11px; padding: 2px 8px; border-radius: 10px;'>{len(df)} records</span>", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        for _, row in df.iterrows():
+            with st.container():
+                st.markdown(f"""
+                <div style="background-color: #0f172a; border: 1px solid #1e293b; padding: 14px; border-radius: 8px; margin-bottom: 10px;">
+                    <span style="background-color: #064e3b; color: #34d399; font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 4px;">SUPPLIER QUOTE</span>
+                    <h4 style="color: white; margin: 6px 0 4px 0; font-size: 14px;">{row['material_description']}</h4>
+                    <p style="color: #94a3b8; font-size: 11px; margin: 0;">
+                        Vendor: {row['supplier_name']} • Cost: <span style="color: #34d399; font-weight: bold;">${row['quote_cost']:,.2f}</span>
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+                if st.button("View", key=f"btn_supplier_{row['supplier_id']}"):
+                    st.session_state['selected_record'] = row.to_dict()
 
-        loadData();
-    </script>
-</body>
-</html>
-    """
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+with col_right:
+    st.markdown("<h3 style='font-size: 13px; color: #cbd5e1; font-weight: bold; letter-spacing: 0.05em;'>INTELLIGENCE & MARGIN TRACKING</h3>", unsafe_allow_html=True)
+    st.markdown("<p style='font-size: 11px; color: #64748b; margin-top: -5px;'>Computed unit economics and automated bid baselines.</p>", unsafe_allow_html=True)
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    if st.session_state['selected_record'] is not None:
+        st.markdown("""
+        <div style="border-bottom: 1px solid #1e293b; padding-bottom: 6px; margin-bottom: 10px;">
+            <span style="font-size: 11px; color: #818cf8; font-weight: bold; text-transform: uppercase;">Inspection Telemetry</span>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        for key, val in st.session_state['selected_record'].items():
+            formatted_key = key.replace('_', ' ').title()
+            st.markdown(f"<div style='margin-bottom: 8px;'><strong style='color: #94a3b8; font-size: 11px;'>{formatted_key}:</strong><br><span style='color: #f1f5f9; font-size: 12px;'>{val}</span></div>", unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style="border: 1px dashed #1e293b; border-radius: 8px; padding: 40px 20px; text-align: center; color: #64748b;">
+            <p style="font-weight: 500; color: #cbd5e1; font-size: 13px; margin: 0;">No record selected</p>
+            <p style="font-size: 11px; color: #64748b; margin-top: 5px;">Select an item from the left panel to inspect economic data.</p>
+        </div>
+        """, unsafe_allow_html=True)
